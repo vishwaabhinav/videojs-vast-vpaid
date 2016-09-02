@@ -12,13 +12,15 @@ var dom = require('../utils/dom');
 var playerUtils = require('../utils/playerUtils');
 var utilities = require('../utils/utilityFunctions');
 
-var logger = require ('../utils/consoleLogger');
+var logger = require('../utils/consoleLogger');
 
 module.exports = function VASTPlugin(options) {
   var snapshot;
   var player = this;
   var vast = new VASTClient();
   var adsCanceled = false;
+  var adIsPlaying = false;
+  var midRollPlayed = false;
   var defaultOpts = {
     // maximum amount of time in ms to wait to receive `adsready` from the ad
     // implementation after play has been requested. Ad implementations are
@@ -55,12 +57,16 @@ module.exports = function VASTPlugin(options) {
     // 2 - error, warn, info
     // 3 - error, warn, info, log
     // 4 - error, warn, info, log, debug
-    verbosity: 0
+    verbosity: 0,
+
+    adPosition: 'pre',
+
+    midRollPosition: 0
   };
 
   var settings = utilities.extend({}, defaultOpts, options || {});
 
-  if(utilities.isUndefined(settings.adTagUrl) && utilities.isDefined(settings.url)){
+  if (utilities.isUndefined(settings.adTagUrl) && utilities.isDefined(settings.url)) {
     settings.adTagUrl = settings.url;
   }
 
@@ -76,39 +82,81 @@ module.exports = function VASTPlugin(options) {
     return trackAdError(new VASTError('on VideoJS VAST plugin, missing adTagUrl on options object'));
   }
 
-  logger.setVerbosity (settings.verbosity);
+  logger.setVerbosity(settings.verbosity);
 
-  vastUtil.runFlashSupportCheck(settings.vpaidFlashLoaderPath);// Necessary step for VPAIDFLASHClient to work.
+  vastUtil.runFlashSupportCheck(settings.vpaidFlashLoaderPath); // Necessary step for VPAIDFLASHClient to work.
 
-  playerUtils.prepareForAds(player);
+  if (settings.adPosition === 'pre') {
+    playerUtils.prepareForAds(player);
+  } else if (settings.adPosition === 'post') {
+    player.on('ended', function() {
+      console.log('Video content ended');
+      tryToPlayAd();
+    });
+  } else {
+    player.on('timeupdate', midRollPlay);
+  }
+
+  function midRollPlay() {
+    if (adIsPlaying || midRollPlayed) {
+      return;
+    }
+    if (Math.floor(settings.midRollPosition) === Math.floor(player.currentTime()) &&
+      !player.paused()) {
+      player.off('timeupdate', midRollPlay);
+      tryToPlayAd();
+      midRollPlayed = true;
+    }
+  }
+
+  player.on('vast.adStart', function() {
+    adIsPlaying = true;
+  });
+
+  player.on('vast.adEnd', function() {
+    adIsPlaying = false;
+  });
+
+  player.on('playing', function() {
+    if (!adIsPlaying) {
+      player.on('timeupdate', midRollPlay);
+    }
+  });
+
+  player.on('paused', function() {
+    if (!adIsPlaying) {
+      player.off('timeupdate', midRollPlay);
+    }
+  });
+
 
   if (settings.playAdAlways) {
     // No matter what happens we play a new ad before the user sees the video again.
-    player.on('vast.contentEnd', function () {
-      setTimeout(function () {
+    player.on('vast.contentEnd', function() {
+      setTimeout(function() {
         player.trigger('vast.reset');
       }, 0);
     });
   }
 
-  player.on('vast.firstPlay', tryToPlayPrerollAd);
+  player.on('vast.firstPlay', tryToPlayAd);
 
-  player.on('vast.reset', function () {
+  player.on('vast.reset', function() {
     //If we are reseting the plugin, we don't want to restore the content
     snapshot = null;
     cancelAds();
   });
 
   player.vast = {
-    isEnabled: function () {
+    isEnabled: function() {
       return settings.adsEnabled;
     },
 
-    enable: function () {
+    enable: function() {
       settings.adsEnabled = true;
     },
 
-    disable: function () {
+    disable: function() {
       settings.adsEnabled = false;
     }
   };
@@ -116,27 +164,31 @@ module.exports = function VASTPlugin(options) {
   return player.vast;
 
   /**** Local functions ****/
-  function tryToPlayPrerollAd() {
+  function tryToPlayAd() {
     //We remove the poster to prevent flickering whenever the content starts playing
     playerUtils.removeNativePoster(player);
 
-    playerUtils.once(player, ['vast.adsCancel', 'vast.adEnd'], function () {
+    playerUtils.once(player, ['vast.adsCancel', 'vast.adEnd'], function() {
       removeAdUnit();
       restoreVideoContent();
     });
 
-    async.waterfall([
+    var taskList = [
       checkAdsEnabled,
       preparePlayerForAd,
       startAdCancelTimeout,
-      playPrerollAd
-    ], function (error, response) {
+      triggerAdPlay
+    ];
+
+    var callback = function(error, response) {
       if (error) {
         trackAdError(error, response);
       } else {
         player.trigger('vast.adEnd');
       }
-    });
+    };
+
+    async.waterfall(taskList, callback);
 
     /*** Local functions ***/
 
@@ -155,15 +207,15 @@ module.exports = function VASTPlugin(options) {
     }
 
     function setupContentEvents() {
-      playerUtils.once(player, ['playing', 'vast.reset', 'vast.firstPlay'], function (evt) {
+      playerUtils.once(player, ['playing', 'vast.reset', 'vast.firstPlay'], function(evt) {
         if (evt.type !== 'playing') {
           return;
         }
 
         player.trigger('vast.contentStart');
 
-        playerUtils.once(player, ['ended', 'vast.reset', 'vast.firstPlay'], function (evt) {
-          if (evt.type === 'ended') {
+        playerUtils.once(player, ['ended', 'vast.reset', 'vast.firstPlay'], function(evt) {
+          if (evt.type === 'ended' && !adIsPlaying) {
             player.trigger('vast.contentEnd');
           }
         });
@@ -183,7 +235,7 @@ module.exports = function VASTPlugin(options) {
         player.pause();
         addSpinnerIcon();
 
-        if(player.paused()) {
+        if (player.paused()) {
           next(null);
         } else {
           playerUtils.once(player, ['playing'], function() {
@@ -204,7 +256,7 @@ module.exports = function VASTPlugin(options) {
       var adCancelTimeoutId;
       adsCanceled = false;
 
-      adCancelTimeoutId = setTimeout(function () {
+      adCancelTimeoutId = setTimeout(function() {
         trackAdError(new VASTError('timeout while waiting for the video to start playing', 402));
       }, settings.adCancelTimeout);
 
@@ -229,7 +281,7 @@ module.exports = function VASTPlugin(options) {
     function removeSpinnerIcon() {
       //IMPORTANT NOTE: We remove the spinnerIcon asynchronously to give time to the browser to start the video.
       // If we remove it synchronously we see a flash of the content video before the ad starts playing.
-      setTimeout(function () {
+      setTimeout(function() {
         dom.removeClass(player.el(), 'vjs-vast-ad-loading');
       }, 100);
     }
@@ -241,7 +293,7 @@ module.exports = function VASTPlugin(options) {
     adsCanceled = true;
   }
 
-  function playPrerollAd(callback) {
+  function triggerAdPlay(callback) {
     async.waterfall([
       getVastResponse,
       playAd
@@ -262,7 +314,7 @@ module.exports = function VASTPlugin(options) {
     var adIntegrator = isVPAID(vastResponse) ? new VPAIDIntegrator(player, settings) : new VASTIntegrator(player);
     var adFinished = false;
 
-    playerUtils.once(player, ['vast.adStart', 'vast.adsCancel'], function (evt) {
+    playerUtils.once(player, ['vast.adStart', 'vast.adsCancel'], function(evt) {
       if (evt.type === 'vast.adStart') {
         addAdsLabel();
       }
@@ -275,7 +327,7 @@ module.exports = function VASTPlugin(options) {
     }
 
     player.vast.vastResponse = vastResponse;
-    logger.debug ("calling adIntegrator.playAd() with vastResponse:", vastResponse);
+    logger.debug("calling adIntegrator.playAd() with vastResponse:", vastResponse);
     player.vast.adUnit = adIntegrator.playAd(vastResponse, callback);
 
     /*** Local functions ****/
@@ -336,9 +388,12 @@ module.exports = function VASTPlugin(options) {
   }
 
   function trackAdError(error, vastResponse) {
-    player.trigger({type: 'vast.adError', error: error});
+    player.trigger({
+      type: 'vast.adError',
+      error: error
+    });
     cancelAds();
-    logger.error ('AD ERROR:', error.message, error, vastResponse);
+    logger.error('AD ERROR:', error.message, error, vastResponse);
   }
 
   function isVPAID(vastResponse) {
